@@ -491,6 +491,15 @@ protected:
   void xFindAlreadyTestedNearbyIntraModes ( int currentLfnstIdx, int currentIntraMode, int* refLfnstIdx, int* leftIntraMode, int* rightIntraMode, ISPType ispOption, int windowSize );
   bool updateISPStatusFromRelCU           ( double bestNonISPCostCurrCu, ModeInfo bestNonISPModeCurrCu, int& bestISPModeInRelCU );
   void xFinishISPModes                    ( );
+
+#define PREDECT_INTRA_RDO 1
+
+public:
+  CuType cuCls;
+  int    lumaQP;
+  bool   searchTerminateFlag;
+
+  bool isISP;
 };// END CLASS DEFINITION EncSearch
 
 //! \}

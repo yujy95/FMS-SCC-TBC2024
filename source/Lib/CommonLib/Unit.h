@@ -285,6 +285,20 @@ struct TransformUnit;
 struct PredictionUnit;
 class  CodingStructure;
 
+///  cu类型：1：CC、2：A、3：CC-A、4：TGM、5:CC-TGM、6：A-TGM、7：CC-A-TGM
+
+enum CuType
+{
+  NONE_TYPE,
+  CC,
+  A,
+  CC_A,
+  TGM,
+  CC_TGM,
+  A_TGM,
+  CC_A_TGM
+};
+
 struct CodingUnit : public UnitArea
 {
   CodingStructure *cs;

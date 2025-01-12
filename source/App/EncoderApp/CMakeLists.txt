@@ -50,6 +50,9 @@ if( EXTENSION_HDRTOOLS )
   target_link_libraries( ${EXE_NAME} HDRLib )
 endif()
 
+# libtorch
+target_link_libraries( ${EXE_NAME} c10.lib kineto.lib torch.lib torch_cpu.lib )
+
 # lldb custom data formatters
 if( XCODE )
   add_dependencies( ${EXE_NAME} Install${PROJECT_NAME}LldbFiles )

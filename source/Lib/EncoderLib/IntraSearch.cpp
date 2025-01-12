@@ -47,8 +47,23 @@
 #include "CommonLib/dtrace_next.h"
 #include "CommonLib/dtrace_buffer.h"
 
+#include "DTree/DTreeIntraRdoTGM.h"
+
 #include <math.h>
 #include <limits>
+
+#define THRESHOLD_NUM 1
+static float thresholds[THRESHOLD_NUM];
+enum ThresholdType
+{
+  TH_INTRA_RDO_TGM,
+};
+
+void initThreshold()
+{
+  thresholds[TH_INTRA_RDO_TGM] = 0.5;
+}
+
  //! \ingroup EncoderLib
  //! \{
 #define PLTCtx(c) SubCtx( Ctx::Palette, c )
@@ -600,7 +615,16 @@ bool IntraSearch::estIntraPredLumaQT(CodingUnit &cu, Partitioner &partitioner, c
     }
   }
 
-  const bool testBDPCM = sps.getBDPCMEnabledFlag() && CU::bdpcmAllowed(cu, ComponentID(partitioner.chType)) && cu.mtsFlag == 0 && cu.lfnstIdx == 0;
+// modify：CC不进行BDPCM
+
+#if PREDECT_INTRA_RDO
+  const bool testBDPCM = sps.getBDPCMEnabledFlag() && CU::bdpcmAllowed(cu, ComponentID(partitioner.chType))
+                         && cu.mtsFlag == 0 && cu.lfnstIdx == 0 && (cuCls != CC);
+#else
+  const bool testBDPCM = sps.getBDPCMEnabledFlag() && CU::bdpcmAllowed(cu, ComponentID(partitioner.chType))
+                         && cu.mtsFlag == 0 && cu.lfnstIdx == 0;
+#endif
+
   static_vector<ModeInfo, FAST_UDI_MAX_RDMODE_NUM> hadModeList;
   static_vector<double, FAST_UDI_MAX_RDMODE_NUM>   candCostList;
   static_vector<double, FAST_UDI_MAX_RDMODE_NUM>   candHadList;
@@ -1300,6 +1324,14 @@ bool IntraSearch::estIntraPredLumaQT(CodingUnit &cu, Partitioner &partitioner, c
     }
     int bestLfnstIdx = cu.lfnstIdx;
 
+    /// add：BDPCM编码信息
+
+    int    resiBuf[128][128] = { 0 };
+    double bestCostBDPCM     = MAX_DOUBLE;
+
+    int bestModeIndex = -100;
+    int isBDPCM       = -100;
+
     for (int mode = isSecondColorSpace ? 0 : -2 * int(testBDPCM); mode < (int) rdModeList.size(); mode++)
     {
       // set CU/PU to luma prediction mode
@@ -1414,6 +1446,35 @@ bool IntraSearch::estIntraPredLumaQT(CodingUnit &cu, Partitioner &partitioner, c
 
       if( tmpValidReturn )
       {
+      /// add：记录bdpcm的编码信息
+
+#if PREDECT_INTRA_RDO
+        if (cuCls == TGM)
+        {
+          if (mode < 0)
+          {
+            if (csTemp->cost < bestCostBDPCM)
+            {
+              bestCostBDPCM = csTemp->cost;
+
+              PelBuf predBufBDPCM = csTemp->picture->getPredBuf(cu.Y());
+              PelBuf recoBufBDPCM = csTemp->picture->getRecoBuf(cu.Y());
+              for (int h = 0; h < height; h++)
+              {
+                for (int w = 0; w < width; w++)
+                {
+                  resiBuf[h][w] = int(abs(recoBufBDPCM.at(w, h) - predBufBDPCM.at(w, h)));
+                }
+              }
+            }
+          }
+          else if (testBDPCM && mode == 0)
+          {
+            isBDPCM = (csTemp->cost > bestCostBDPCM);
+          }
+        }
+#endif
+
         if (isFirstColorSpace)
         {
           if (m_pcEncCfg->getRGBFormatFlag() || !cu.ispMode)
@@ -1482,6 +1543,95 @@ bool IntraSearch::estIntraPredLumaQT(CodingUnit &cu, Partitioner &partitioner, c
           }
         }
       }
+
+
+/// add：bdpcm预测终止（检查第1个方向模式之后终止）
+
+#if PREDECT_INTRA_RDO
+      if (mode == 0 && cuCls == TGM && bestCostBDPCM != MAX_DOUBLE)
+      {
+        double zeroNum          = 0;
+        double allSum           = 0;
+        double horizenSum[128]  = { 0 };
+        double verticalSum[128] = { 0 };
+        for (int h = 0; h < height; h++)
+        {
+          for (int w = 0; w < width; w++)
+          {
+            int lumaRes = resiBuf[h][w];
+
+            allSum += lumaRes;
+            horizenSum[h] += lumaRes;
+            verticalSum[w] += lumaRes;
+
+            if (lumaRes == 0)
+            {
+              zeroNum++;
+            }
+          }
+        }
+        double allAve = allSum / (height * width);
+
+        double horizenAve[128]  = { 0 };
+        double verticalAve[128] = { 0 };
+        for (int h = 0; h < height; h++)
+        {
+          horizenAve[h] = horizenSum[h] / width;
+        }
+        for (int w = 0; w < width; w++)
+        {
+          verticalAve[w] = verticalSum[w] / height;
+        }
+
+        double bdpcmZeroPercent = zeroNum / (height * width);
+
+        double bdpcmResVar = 0;
+        double bdpcmResHor = 0;
+        double bdpcmResVer = 0;
+        for (int h = 0; h < height; h++)
+        {
+          for (int w = 0; w < width; w++)
+          {
+            int lumaRes = resiBuf[h][w];
+
+            bdpcmResVar += pow(lumaRes - allAve, 2);
+            bdpcmResHor += pow(lumaRes - horizenAve[h], 2);
+            bdpcmResVer += pow(lumaRes - verticalAve[w], 2);
+          }
+        }
+        bdpcmResVar /= (height * width);
+        bdpcmResHor /= (height * width);
+        bdpcmResVer /= (height * width);
+
+        float featuresRDO[8] = { 0 };
+        float resultRDO[2]   = { 0 };
+
+        featuresRDO[0] = lumaQP;
+        featuresRDO[1] = height * width;
+        featuresRDO[2] = bestCostBDPCM;
+        featuresRDO[3] = bdpcmZeroPercent;
+        featuresRDO[4] = bdpcmResVar;
+        featuresRDO[5] = bdpcmResHor;
+        featuresRDO[6] = bdpcmResVer;
+        featuresRDO[7] = isBDPCM;
+
+        float thresholdRDO = 1;
+
+        intraRdoTGMPredict(featuresRDO, resultRDO);
+        thresholdRDO = thresholds[TH_INTRA_RDO_TGM];
+
+        if (resultRDO[0] != 0 || resultRDO[1] != 0)
+        {
+          float probabilityRDO = resultRDO[1] / (resultRDO[0] + resultRDO[1]);
+
+          if (probabilityRDO > thresholdRDO)
+          {
+            searchTerminateFlag = true;
+            break;
+          }
+        }
+      }
+#endif
     } // Mode loop
     cu.ispMode = uiBestPUMode.ispMod;
     cu.lfnstIdx = bestLfnstIdx;

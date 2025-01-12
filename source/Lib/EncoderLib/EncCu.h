@@ -92,6 +92,16 @@ struct SmallerThanComboCost
   }
 };
 
+/*** ctu预测器 ***/
+
+struct PicPredictor
+{
+  float *resultCTUContent;
+  int    ctuWidthNum;
+  int    ctuHightNum;
+};
+
+
 class GeoComboCostList
 {
 public:
@@ -237,6 +247,18 @@ public:
   EncCu();
   ~EncCu();
 
+  ///  ctu预测器
+
+  PicPredictor picPredictor;
+  void         setPicPredictor(PicPredictor &predictor) { picPredictor = predictor; }
+
+  struct IntraInfo
+  {
+    bool isISP;
+    int  bestModeType;
+  };
+
+
 protected:
 
   void xCalDebCost            ( CodingStructure &cs, Partitioner &partitioner, bool calDist = false );
@@ -249,8 +271,9 @@ protected:
 
   void xCheckModeSplit        ( CodingStructure *&tempCS, CodingStructure *&bestCS, Partitioner &pm, const EncTestMode& encTestMode, const ModeType modeTypeParent, bool &skipInterPass, double *splitRdCostBest);
 
-  bool xCheckRDCostIntra(CodingStructure *&tempCS, CodingStructure *&bestCS, Partitioner &pm, const EncTestMode& encTestMode, bool adaptiveColorTrans);
-
+  bool xCheckRDCostIntra(CodingStructure *&tempCS, CodingStructure *&bestCS, Partitioner &pm,
+                         const EncTestMode &encTestMode, bool adaptiveColorTrans, IntraInfo &intraInfo, CuType cuCls);
+                         
   void xCheckDQP              ( CodingStructure& cs, Partitioner& partitioner, bool bKeepCtx = false);
   void xCheckChromaQPOffset   ( CodingStructure& cs, Partitioner& partitioner);
 
@@ -286,6 +309,14 @@ protected:
   void xCheckRDCostIBCModeMerge2Nx2N( CodingStructure *&tempCS, CodingStructure *&bestCS, Partitioner &partitioner, const EncTestMode& encTestMode );
 
   void xCheckPLT              ( CodingStructure *&tempCS, CodingStructure *&bestCS, Partitioner &partitioner, const EncTestMode& encTestMode );
+
+#define PREDECT_INTRA 1
+#define PREDECT_PLT 1
+#define PREDECT_IBC 1
+
+#define PREDECT_T 1
+
+#define PREDECT_SPLIT 1
 };
 
 //! \}

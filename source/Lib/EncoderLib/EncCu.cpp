@@ -54,6 +54,89 @@
 #include <algorithm>
 
 
+//  自定义变量
+// ====================================================================================================================
+
+#include "DTree/DTreeIntraA.h"
+#include "DTree/DTreeIntraTGM.h"
+
+#include "DTree/DTreeIntraTA.h"
+#include "DTree/DTreeIntraTTGM.h"
+
+#include "DTree/DTreePltA.h"
+#include "DTree/DTreePltTGM.h"
+
+#include "DTree/DTreePltTA.h"
+#include "DTree/DTreePltTTGM.h"
+
+#include "DTree/DTreeIbcA.h"
+#include "DTree/DTreeIbcTGM.h"
+
+#include "DTree/DTreeSplitA.h"
+#include "DTree/DTreeSplitCC.h"
+
+static int  ctuX        = 0;
+static int  ctuY        = 0;
+static int  ctuPosition = 0;
+static bool isBorder    = false;
+static int  lumaQP      = 0;
+
+static float ctuContentProbability[3][32][32];
+static int   ctuClass[32][32];
+
+static int picMode[360][640];
+
+enum PreModeType
+{
+  PRE_INTRA,
+  PRE_PLT,
+  PRE_IMERGE,
+  PRE_IBC,
+};
+
+#define THRESHOLD_NUM 12
+enum ThresholdType
+{
+  TH_INTRA_A,
+  TH_INTRA_TGM,
+
+  TH_INTRA_T_A,
+  TH_INTRA_T_TGM,
+
+  TH_PLT_A,
+  TH_PLT_TGM,
+
+  TH_PLT_T_A,
+  TH_PLT_T_TGM,
+
+  TH_IBC_A,
+  TH_IBC_TGM,
+
+  TH_SPLIT_A,
+  TH_SPLIT_CC,
+};
+static float thresholds[THRESHOLD_NUM];
+
+void initThresholds()
+{
+  thresholds[TH_INTRA_A]   = 0.2;
+  thresholds[TH_INTRA_TGM] = 0.2;
+
+  thresholds[TH_INTRA_T_A]   = 0.9;
+  thresholds[TH_INTRA_T_TGM] = 0.9;
+
+  thresholds[TH_PLT_A]   = 0.5;
+  thresholds[TH_PLT_TGM] = 0.1;
+
+  thresholds[TH_PLT_T_A]   = 0.9;
+  thresholds[TH_PLT_T_TGM] = 0.9;
+
+  thresholds[TH_IBC_A]   = 0.2;
+  thresholds[TH_IBC_TGM] = 0.2;
+
+  thresholds[TH_SPLIT_A]  = 0.5;
+  thresholds[TH_SPLIT_CC] = 0.5;
+}
 
 //! \ingroup EncoderLib
 //! \{
@@ -251,6 +334,10 @@ void EncCu::init( EncLib* pcEncLib, const SPS& sps )
   m_pcInterSearch->setModeCtrl( m_modeCtrl );
   m_modeCtrl->setInterSearch(m_pcInterSearch);
   m_pcIntraSearch->setModeCtrl( m_modeCtrl );
+
+  /// add：初始化阈值
+
+  initThresholds();
 }
 
 // ====================================================================================================================
@@ -302,6 +389,46 @@ void EncCu::compressCtu( CodingStructure& cs, const UnitArea& area, const unsign
   tempCS->currQP[CH_L] = bestCS->currQP[CH_L] =
   tempCS->baseQP       = bestCS->baseQP       = currQP[CH_L];
   tempCS->prevQP[CH_L] = bestCS->prevQP[CH_L] = prevQP[CH_L];
+
+  /*** ctu信息获取 ***/
+
+  ctuX     = area.lx() / 128;
+  ctuY     = area.ly() / 128;
+  isBorder = area.lx() >= (cs.picture->lwidth() / 128) * 128 || area.ly() >= (cs.picture->lheight() / 128) * 128;
+  lumaQP   = currQP[CH_L];
+
+  if (!isBorder && isLuma(partitioner.chType))
+  {
+    ctuPosition = (ctuY * picPredictor.ctuWidthNum + ctuX) * 3 * 32 * 32;
+    memcpy(ctuContentProbability, &picPredictor.resultCTUContent[ctuPosition], 3 * 32 * 32 * sizeof(float));
+    if (ctuPosition == 0)
+    {
+      for (int i = 0; i < 360; i++)
+      {
+        for (int j = 0; j < 640; j++)
+        {
+          picMode[i][j] = -1;
+        }
+      }
+    }
+
+    for (int h = 0; h < 32; h++)
+    {
+      for (int w = 0; w < 32; w++)
+      {
+        ctuClass[h][w] = 0;
+        for (int cls = 1; cls < 3; cls++)
+        {
+          if (ctuContentProbability[ctuClass[h][w]][h][w] < ctuContentProbability[cls][h][w])
+          {
+            ctuClass[h][w] = cls;
+          }
+        }
+      }
+    }
+  }
+
+  /***********************/
 
   xCompressCU(tempCS, bestCS, partitioner);
   cs.slice->m_mapPltCost[0].clear();
@@ -716,6 +843,289 @@ void EncCu::xCompressCU( CodingStructure*& tempCS, CodingStructure*& bestCS, Par
     m_bestBcwCost[0] = m_bestBcwCost[1] = std::numeric_limits<double>::max();
     m_bestBcwIdx[0] = m_bestBcwIdx[1] = -1;
   }
+
+  /******************* cu预测 *******************/
+
+  /// cu类型判定
+
+  CuType cuCls = NONE_TYPE;
+  if (!isBorder && isLuma(partitioner.chType))
+  {
+    int cuClsCount[3] = { 0 };
+
+    int cuX      = (currCsArea.lx() % 128) >> 2;
+    int cuY      = (currCsArea.ly() % 128) >> 2;
+    int cuWidth  = (currCsArea.lwidth()) >> 2;
+    int cuHeight = (currCsArea.lheight()) >> 2;
+
+    for (int h = 0; h < cuHeight; h++)
+    {
+      for (int w = 0; w < cuWidth; w++)
+      {
+        cuClsCount[ctuClass[cuY + h][cuX + w]]++;
+      }
+    }
+
+    for (int i = 0; i < 3; i++)
+    {
+      if (cuClsCount[i] != 0)
+      {
+        cuCls = CuType(int(cuCls) + int(pow(2, i)));
+      }
+    }
+  }
+
+  int lheightCurrArea = currCsArea.lheight();
+  int lwidthCurrArea  = currCsArea.lwidth();
+  int lxCurrArea      = currCsArea.lx();
+  int lyCurrArea      = currCsArea.ly();
+
+  /// 计算方差
+
+  float currVar     = -1;
+  float horizonVar  = -1;
+  float verticalVar = -1;
+
+  if (cuCls == A || cuCls == CC || cuCls == TGM)
+  {
+    currVar     = 0;
+    horizonVar  = 0;
+    verticalVar = 0;
+
+    PelBuf origBuf = bestCS->picture->getTrueOrigBuf().Y();
+
+    /// 计算当前块方差
+
+    float currSum = 0;
+    for (int lh = 0; lh < lheightCurrArea; lh++)
+    {
+      for (int lw = 0; lw < lwidthCurrArea; lw++)
+      {
+        currSum += origBuf.at(lxCurrArea + lw, lyCurrArea + lh);
+      }
+    }
+    float currAvg = currSum / (lheightCurrArea * lwidthCurrArea);
+    for (int lh = 0; lh < lheightCurrArea; lh++)
+    {
+      for (int lw = 0; lw < lwidthCurrArea; lw++)
+      {
+        currVar += pow(origBuf.at(lxCurrArea + lw, lyCurrArea + lh) - currAvg, 2);
+      }
+    }
+    currVar /= (lheightCurrArea * lwidthCurrArea);
+
+    /// 计算当前块水平、垂直方差
+
+    float horizonSum[128]  = { 0 };
+    float verticalSum[128] = { 0 };
+    for (int lh = 0; lh < lheightCurrArea; lh++)
+    {
+      for (int lw = 0; lw < lwidthCurrArea; lw++)
+      {
+        horizonSum[lh] += origBuf.at(lxCurrArea + lw, lyCurrArea + lh);
+        verticalSum[lw] += origBuf.at(lxCurrArea + lw, lyCurrArea + lh);
+      }
+    }
+
+    float horizonAvgs[128]  = { 0 };
+    float verticalAvgs[128] = { 0 };
+    for (int lh = 0; lh < lheightCurrArea; lh++)
+    {
+      horizonAvgs[lh] = horizonSum[lh] / lwidthCurrArea;
+    }
+    for (int lw = 0; lw < lwidthCurrArea; lw++)
+    {
+      verticalAvgs[lw] = verticalSum[lw] / lheightCurrArea;
+    }
+
+    float horizonVars[128]  = { 0 };
+    float verticalVars[128] = { 0 };
+    for (int lh = 0; lh < lheightCurrArea; lh++)
+    {
+      for (int lw = 0; lw < lwidthCurrArea; lw++)
+      {
+        horizonVars[lh] += pow(origBuf.at(lxCurrArea + lw, lyCurrArea + lh) - horizonAvgs[lh], 2);
+        verticalVars[lw] += pow(origBuf.at(lxCurrArea + lw, lyCurrArea + lh) - verticalAvgs[lw], 2);
+      }
+    }
+
+    for (int lh = 0; lh < lheightCurrArea; lh++)
+    {
+      horizonVar += horizonVars[lh];
+    }
+    for (int lw = 0; lw < lwidthCurrArea; lw++)
+    {
+      verticalVar += verticalVars[lw];
+    }
+    horizonVar /= (lheightCurrArea * lwidthCurrArea);
+    verticalVar /= (lheightCurrArea * lwidthCurrArea);
+  }
+
+#if (PREDECT_INTRA | PREDECT_PLT | PREDECT_IBC)
+  /// 计算阈值权重
+
+  float thresholdWeightIntra = -1;
+  float thresholdWeightPlt   = -1;
+  float thresholdWeightIbc   = -1;
+
+  if ((cuCls == A || cuCls == TGM) && lyCurrArea >= lheightCurrArea && lxCurrArea >= lwidthCurrArea)
+  {
+    PelBuf origBuf = bestCS->picture->getTrueOrigBuf().Y();
+
+    /// 计算相邻块方差
+
+    float leftSum      = 0;
+    float leftAboveSum = 0;
+    float aboveSum     = 0;
+    for (int lh = 0; lh < lheightCurrArea; lh++)
+    {
+      for (int lw = 0; lw < lwidthCurrArea; lw++)
+      {
+        leftSum += origBuf.at(lxCurrArea - lwidthCurrArea + lw, lyCurrArea + lh);
+        leftAboveSum += origBuf.at(lxCurrArea - lwidthCurrArea + lw, lyCurrArea - lheightCurrArea + lh);
+        aboveSum += origBuf.at(lxCurrArea + lw, lyCurrArea - lheightCurrArea + lh);
+      }
+    }
+    float leftAvg      = leftSum / (lheightCurrArea * lwidthCurrArea);
+    float leftAboveAvg = leftAboveSum / (lheightCurrArea * lwidthCurrArea);
+    float aboveAvg     = aboveSum / (lheightCurrArea * lwidthCurrArea);
+
+    float leftVar      = 0;
+    float leftAboveVar = 0;
+    float aboveVar     = 0;
+    for (int lh = 0; lh < lheightCurrArea; lh++)
+    {
+      for (int lw = 0; lw < lwidthCurrArea; lw++)
+      {
+        leftVar += pow(origBuf.at(lxCurrArea - lwidthCurrArea + lw, lyCurrArea + lh) - leftAvg, 2);
+        leftAboveVar +=
+          pow(origBuf.at(lxCurrArea - lwidthCurrArea + lw, lyCurrArea - lheightCurrArea + lh) - leftAboveAvg, 2);
+        aboveVar += pow(origBuf.at(lxCurrArea + lw, lyCurrArea - lheightCurrArea + lh) - aboveAvg, 2);
+      }
+    }
+    leftVar /= (lheightCurrArea * lwidthCurrArea);
+    leftAboveVar /= (lheightCurrArea * lwidthCurrArea);
+    aboveVar /= (lheightCurrArea * lwidthCurrArea);
+
+    /// 计算阈值权重
+
+    float leftRelevance      = abs(sqrt(currVar) - sqrt(leftVar));
+    float leftAboveRelevance = abs(sqrt(currVar) - sqrt(leftAboveVar));
+    float aboveRelevance     = abs(sqrt(currVar) - sqrt(aboveVar));
+
+    float allWeight       = exp(-leftRelevance) + exp(-leftAboveRelevance) + exp(-aboveRelevance);
+    float leftWeight      = allWeight == 0 ? 0.34 : exp(-leftRelevance) / allWeight;
+    float leftAboveWeight = allWeight == 0 ? 0.33 : exp(-leftAboveRelevance) / allWeight;
+    float aboveWeight     = allWeight == 0 ? 0.33 : exp(-aboveRelevance) / allWeight;
+
+    int lxCurrMode      = lxCurrArea >> 2;
+    int lyCurrMode      = lyCurrArea >> 2;
+    int lwidthCurrMode  = lwidthCurrArea >> 2;
+    int lheightCurrMode = lheightCurrArea >> 2;
+
+    float leftProbabilityIntra      = 0;
+    float leftAboveProbabilityIntra = 0;
+    float aboveProbabilityIntra     = 0;
+
+    float leftProbabilityPlt      = 0;
+    float leftAboveProbabilityPlt = 0;
+    float aboveProbabilityPlt     = 0;
+
+    float leftProbabilityIbc      = 0;
+    float leftAboveProbabilityIbc = 0;
+    float aboveProbabilityIbc     = 0;
+
+    for (int h = 0; h < lheightCurrMode; h++)
+    {
+      for (int w = 0; w < lwidthCurrMode; w++)
+      {
+        int leftMode      = picMode[lyCurrMode + h][lxCurrMode - lwidthCurrMode + w];
+        int leftAboveMode = picMode[lyCurrMode - lheightCurrMode + h][lxCurrMode - lwidthCurrMode + w];
+        int aboveMode     = picMode[lyCurrMode - lheightCurrMode + h][lxCurrMode + w];
+
+        leftProbabilityIntra += (leftMode == int(MODE_INTRA) || leftMode == -1);
+        leftAboveProbabilityIntra += (leftAboveMode == int(MODE_INTRA) || leftAboveMode == -1);
+        aboveProbabilityIntra += (aboveMode == int(MODE_INTRA) || aboveMode == -1);
+
+        leftProbabilityPlt += (leftMode == int(MODE_PLT) || leftMode == -1);
+        leftAboveProbabilityPlt += (leftAboveMode == int(MODE_PLT) || leftAboveMode == -1);
+        aboveProbabilityPlt += (aboveMode == int(MODE_PLT) || aboveMode == -1);
+
+        leftProbabilityIbc += (leftMode == int(MODE_IBC) || leftMode == -1);
+        leftAboveProbabilityIbc += (leftAboveMode == int(MODE_IBC) || leftAboveMode == -1);
+        aboveProbabilityIbc += (aboveMode == int(MODE_IBC) || aboveMode == -1);
+      }
+    }
+
+    leftProbabilityIntra /= (lwidthCurrMode * lheightCurrMode);
+    leftAboveProbabilityIntra /= (lwidthCurrMode * lheightCurrMode);
+    aboveProbabilityIntra /= (lwidthCurrMode * lheightCurrMode);
+
+    leftProbabilityPlt /= (lwidthCurrMode * lheightCurrMode);
+    leftAboveProbabilityPlt /= (lwidthCurrMode * lheightCurrMode);
+    aboveProbabilityPlt /= (lwidthCurrMode * lheightCurrMode);
+
+    leftProbabilityIbc /= (lwidthCurrMode * lheightCurrMode);
+    leftAboveProbabilityIbc /= (lwidthCurrMode * lheightCurrMode);
+    aboveProbabilityIbc /= (lwidthCurrMode * lheightCurrMode);
+
+    thresholdWeightIntra = (leftProbabilityIntra * leftWeight + leftAboveProbabilityIntra * leftAboveWeight
+                            + aboveProbabilityIntra * aboveWeight);
+    thresholdWeightPlt =
+      (leftProbabilityPlt * leftWeight + leftAboveProbabilityPlt * leftAboveWeight + aboveProbabilityPlt * aboveWeight);
+
+    thresholdWeightIbc =
+      (leftProbabilityIbc * leftWeight + leftAboveProbabilityIbc * leftAboveWeight + aboveProbabilityIbc * aboveWeight);
+  }
+
+  /// 计算颜色数
+
+  int colorMax  = 0;
+  int colorsNum = 0;
+  if ((cuCls == A || cuCls == TGM) && lyCurrArea >= lheightCurrArea && lxCurrArea >= lwidthCurrArea)
+  {
+    PelBuf origBuf = bestCS->picture->getTrueOrigBuf().Y();
+
+    int colorCounts[256] = { 0 };
+    for (int lh = 0; lh < lheightCurrArea; lh++)
+    {
+      for (int lw = 0; lw < lwidthCurrArea; lw++)
+      {
+        colorCounts[origBuf.at(lxCurrArea + lw, lyCurrArea + lh)]++;
+      }
+    }
+
+    for (int i = 0; i < 256; i++)
+    {
+      colorMax = std::max(colorMax, colorCounts[i]);
+      if (colorCounts[i] != 0)
+      {
+        colorsNum++;
+      }
+    }
+  }
+#endif
+
+  bool modeCheckFlag[4] = { true, true, true, true };
+
+  /*************************************************************************************/
+
+  double currBestModeCost = MAX_DOUBLE;
+  int    currBestMode     = -1;
+  int    areaSize         = lwidthCurrArea * lheightCurrArea;
+
+  IntraInfo intraInfo;
+  intraInfo.isISP        = false;
+  intraInfo.bestModeType = -1;
+
+  bool predictSplit = (areaSize <= 64 * 64 && areaSize > 4 * 4) && (cuCls == A || cuCls == CC);
+
+  float probabilityIntra = -1;
+  float probabilityPlt   = -1;
+
+  bool predictIntraT = false;
+  bool predictPltT   = false;
+
   do
   {
     for (int i = compBegin; i < (compBegin + numComp); i++)
@@ -726,6 +1136,342 @@ void EncCu::xCompressCU( CodingStructure*& tempCS, CodingStructure*& bestCS, Par
     }
     EncTestMode currTestMode = m_modeCtrl->currTestMode();
     currTestMode.maxCostAllowed = maxCostAllowed;
+
+    /***************** 模式预测 *****************/
+
+    if (cuCls == CC)
+    {
+#if PREDECT_PLT
+      modeCheckFlag[PRE_PLT] = false;
+#endif
+
+#if PREDECT_IBC
+      modeCheckFlag[PRE_IMERGE] = false;
+      modeCheckFlag[PRE_IBC]    = false;
+#endif
+    }
+    else if (cuCls == A || cuCls == TGM)
+    {
+#if PREDECT_INTRA
+      if (currTestMode.type == ETM_INTRA && modeCheckFlag[PRE_INTRA] && thresholdWeightIntra != -1)
+      {
+        float featuresIntra[7];
+        float classesIntra[2] = { 0 };
+
+        featuresIntra[0] = lumaQP;
+        featuresIntra[1] = lheightCurrArea * lwidthCurrArea;
+        featuresIntra[2] = colorMax;  // NHF
+        featuresIntra[3] = colorsNum; // NDC
+        featuresIntra[4] = currVar;
+        featuresIntra[5] = horizonVar;
+        featuresIntra[6] = verticalVar;
+
+        float thresholdIntra = 0;
+
+        if (cuCls == A)
+        {
+          intraAPredict(featuresIntra, classesIntra);
+          thresholdIntra = thresholds[TH_INTRA_A];
+        }
+        else if (cuCls == TGM)
+        {
+          intraTGMPredict(featuresIntra, classesIntra);
+          thresholdIntra = thresholds[TH_INTRA_TGM];
+        }
+
+        if (classesIntra[0] != 0 || classesIntra[1] != 0)
+        {
+          probabilityIntra = classesIntra[1] / (classesIntra[0] + classesIntra[1]);
+          if (probabilityIntra <= thresholdIntra + 0.1 * (1 - thresholdWeightIntra))
+          {
+            modeCheckFlag[PRE_INTRA] = false;
+          }
+#if (PREDECT_INTRA & PREDECT_T)
+          else if (probabilityIntra > 0.9 && thresholdWeightIntra == 1)
+          {
+            predictIntraT = true;
+          }
+#endif
+        }
+      }
+#endif
+
+#if PREDECT_PLT
+      if (currTestMode.type == ETM_PALETTE && modeCheckFlag[PRE_PLT] && thresholdWeightPlt != -1)
+      {
+        /// 颜色段数
+
+        PelBuf origBuf = bestCS->picture->getTrueOrigBuf().Y();
+
+        int horizenContinueColorNum = 1;
+        for (int lh = 0; lh < lheightCurrArea; lh++)
+        {
+          if (lh % 2 == 0)
+          {
+            for (int lw = 0; lw < lwidthCurrArea; lw++)
+            {
+              int currLuma = origBuf.at(lxCurrArea + lw, lyCurrArea + lh);
+              if (lh != 0)
+              {
+                int lastLuma = lw == 0 ? origBuf.at(lxCurrArea + lw, lyCurrArea + lh - 1)
+                                       : origBuf.at(lxCurrArea + lw - 1, lyCurrArea + lh);
+                int diff     = abs(currLuma - lastLuma);
+
+                if (diff != 0)
+                {
+                  horizenContinueColorNum++;
+                }
+              }
+              else if (lw != 0)
+              {
+                int lastLuma = origBuf.at(lxCurrArea + lw - 1, lyCurrArea + lh);
+                int diff     = abs(currLuma - lastLuma);
+
+                if (diff != 0)
+                {
+                  horizenContinueColorNum++;
+                }
+              }
+            }
+          }
+          else
+          {
+            for (int lw = lwidthCurrArea - 1; lw != 0; lw--)
+            {
+              int currLuma = origBuf.at(lxCurrArea + lw, lyCurrArea + lh);
+              int lastLuma = lw == lwidthCurrArea - 1 ? origBuf.at(lxCurrArea + lw, lyCurrArea + lh - 1)
+                                                      : origBuf.at(lxCurrArea + lw + 1, lyCurrArea + lh);
+              int diff     = abs(currLuma - lastLuma);
+
+              if (diff != 0)
+              {
+                horizenContinueColorNum++;
+              }
+            }
+          }
+        }
+
+        int verticalContinueColorNum = 1;
+        for (int lw = 0; lw < lwidthCurrArea; lw++)
+        {
+          if (lw % 2 == 0)
+          {
+            for (int lh = 0; lh < lheightCurrArea; lh++)
+            {
+              int currLuma = origBuf.at(lxCurrArea + lw, lyCurrArea + lh);
+              if (lw != 0)
+              {
+                int lastLuma = lh == 0 ? origBuf.at(lxCurrArea + lw - 1, lyCurrArea + lh)
+                                       : origBuf.at(lxCurrArea + lw, lyCurrArea + lh - 1);
+                int diff     = abs(currLuma - lastLuma);
+
+                if (diff != 0)
+                {
+                  verticalContinueColorNum++;
+                }
+              }
+              else if (lh != 0)
+              {
+                int lastLuma = origBuf.at(lxCurrArea + lw, lyCurrArea + lh - 1);
+                int diff     = abs(currLuma - lastLuma);
+
+                if (diff != 0)
+                {
+                  verticalContinueColorNum++;
+                }
+              }
+            }
+          }
+          else
+          {
+            for (int lh = lheightCurrArea - 1; lh != 0; lh--)
+            {
+              int currLuma = origBuf.at(lxCurrArea + lw, lyCurrArea + lh);
+              int lastLuma = lh == lheightCurrArea - 1 ? origBuf.at(lxCurrArea + lw - 1, lyCurrArea + lh)
+                                                       : origBuf.at(lxCurrArea + lw, lyCurrArea + lh + 1);
+              int diff     = abs(currLuma - lastLuma);
+
+              if (diff != 0)
+              {
+                verticalContinueColorNum++;
+              }
+            }
+          }
+        }
+
+        float featuresPlt[6];
+        float classesPlt[2] = { 0 };
+
+        featuresPlt[0] = lumaQP;
+        featuresPlt[1] = lheightCurrArea * lwidthCurrArea;
+        featuresPlt[2] = colorMax;
+        featuresPlt[3] = colorsNum;
+        featuresPlt[4] = currVar;
+        featuresPlt[5] =
+          horizenContinueColorNum < verticalContinueColorNum ? horizenContinueColorNum : verticalContinueColorNum;
+
+        float thresholdPlt = 0;
+
+        if (cuCls == A)
+        {
+          pltAPredict(featuresPlt, classesPlt);
+          thresholdPlt = thresholds[TH_PLT_A];
+        }
+        else if (cuCls == TGM)
+        {
+          pltTGMPredict(featuresPlt, classesPlt);
+          thresholdPlt = thresholds[TH_PLT_TGM];
+        }
+
+        if (classesPlt[0] != 0 || classesPlt[1] != 0)
+        {
+          probabilityPlt = classesPlt[1] / (classesPlt[0] + classesPlt[1]);
+
+          if (probabilityPlt <= thresholdPlt + 0.1 * (1 - thresholdWeightPlt))
+          {
+            modeCheckFlag[PRE_PLT] = false;
+          }
+#if (PREDECT_PLT & PREDECT_T)
+          else if (probabilityPlt > 0.9 && thresholdWeightPlt == 1)
+          {
+            predictPltT = true;
+          }
+#endif
+        }
+      }
+#endif
+
+#if PREDECT_IBC
+      if (currTestMode.type == ETM_IBC && modeCheckFlag[PRE_IBC] && thresholdWeightIbc != -1)
+      {
+        /// 最佳RD cost、残差
+
+        double ibcBestModeCostBefore = bestCS->cost;
+
+        PelBuf predBuf = bestCS->picture->getPredBuf(currCsArea.Y());
+        PelBuf recoBuf = bestCS->picture->getRecoBuf(currCsArea.Y());
+
+        double resSum = 0;
+        for (int h = 0; h < lheightCurrArea; h++)
+        {
+          for (int w = 0; w < lwidthCurrArea; w++)
+          {
+            resSum += int(abs(recoBuf.at(w, h) - predBuf.at(w, h)));
+          }
+        }
+        double resAve = resSum / (lheightCurrArea * lwidthCurrArea);
+        double resVar = 0;
+        for (int h = 0; h < lheightCurrArea; h++)
+        {
+          for (int w = 0; w < lwidthCurrArea; w++)
+          {
+            resVar += pow(int(abs(recoBuf.at(w, h) - predBuf.at(w, h))) - resAve, 2);
+          }
+        }
+        double ibcBestModeResBefore = resVar / (lheightCurrArea * lwidthCurrArea);
+
+        float featuresIbc[7];
+        float classesIbc[2] = { 0 };
+
+        featuresIbc[0] = lumaQP;
+        featuresIbc[1] = lheightCurrArea * lwidthCurrArea;
+        featuresIbc[2] = colorMax;
+        featuresIbc[3] = colorsNum;
+        featuresIbc[4] = currVar;
+        featuresIbc[5] = ibcBestModeCostBefore;
+        featuresIbc[6] = ibcBestModeResBefore;
+
+        float thresholdIbc = 0;
+
+        if (cuCls == A)
+        {
+          ibcAPredict(featuresIbc, classesIbc);
+          thresholdIbc = thresholds[TH_IBC_A];
+        }
+        else if (cuCls == TGM)
+        {
+          ibcTGMPredict(featuresIbc, classesIbc);
+          thresholdIbc = thresholds[TH_IBC_TGM];
+        }
+
+        if (classesIbc[0] != 0 || classesIbc[1] != 0)
+        {
+          float probabilityIbc = classesIbc[1] / (classesIbc[0] + classesIbc[1]);
+
+          if (probabilityIbc <= thresholdIbc + 0.1 * (1 - thresholdWeightIbc))
+          {
+            modeCheckFlag[PRE_IBC] = false;
+          }
+        }
+      }
+#endif
+    }
+
+    /// 模式跳过
+
+    if (currTestMode.type == ETM_INTRA && !modeCheckFlag[PRE_INTRA])
+    {
+      continue;
+    }
+    if (currTestMode.type == ETM_PALETTE && !modeCheckFlag[PRE_PLT])
+    {
+      continue;
+    }
+    if (currTestMode.type == ETM_IBC_MERGE && !modeCheckFlag[PRE_IMERGE])
+    {
+      continue;
+    }
+    if (currTestMode.type == ETM_IBC && !modeCheckFlag[PRE_IBC])
+    {
+      continue;
+    }
+
+    /**************** 划分终止预测 *******************/
+
+#if PREDECT_SPLIT
+    if (isModeSplit(currTestMode) && predictSplit && currVar != -100 && currBestModeCost != MAX_DOUBLE)
+    {
+      predictSplit = false;
+
+      float featuresSplit[9];
+      float classesSplit[2] = { 0 };
+
+      featuresSplit[0] = lumaQP;
+      featuresSplit[1] = partitioner.currQtDepth;
+      featuresSplit[2] = partitioner.currMtDepth;
+      featuresSplit[3] = currVar;
+      featuresSplit[4] = horizonVar;
+      featuresSplit[5] = verticalVar;
+      featuresSplit[6] = currBestModeCost;
+      featuresSplit[7] = currBestMode;
+      featuresSplit[8] = intraInfo.isISP;
+
+      float thresholdSplit = 0;
+
+      if (cuCls == A)
+      {
+        splitAPredict(featuresSplit, classesSplit);
+        thresholdSplit = thresholds[TH_SPLIT_A];
+      }
+      else if (cuCls == CC)
+      {
+        splitCCPredict(featuresSplit, classesSplit);
+        thresholdSplit = thresholds[TH_SPLIT_CC];
+      }
+
+      if (classesSplit[0] != 0 || classesSplit[1] != 0)
+      {
+        float probabilitySplit = classesSplit[1] / (classesSplit[0] + classesSplit[1]);
+
+        if (probabilitySplit <= thresholdSplit)
+        {
+          break;
+        }
+      }
+    }
+#endif
+
+    /******************************************/
 
     if (pps.getUseDQP() && partitioner.isSepTree(*tempCS) && isChroma( partitioner.chType ))
     {
@@ -831,14 +1577,14 @@ void EncCu::xCompressCU( CodingStructure*& tempCS, CodingStructure*& bestCS, Par
       if (slice.getSPS()->getUseColorTrans() && !CS::isDualITree(*tempCS))
       {
         bool skipSecColorSpace = false;
-        skipSecColorSpace = xCheckRDCostIntra(tempCS, bestCS, partitioner, currTestMode, (m_pcEncCfg->getRGBFormatFlag() ? true : false));
+        skipSecColorSpace = xCheckRDCostIntra(tempCS, bestCS, partitioner, currTestMode, (m_pcEncCfg->getRGBFormatFlag() ? true : false), intraInfo, cuCls);
         if ((m_pcEncCfg->getCostMode() == COST_LOSSLESS_CODING && slice.isLossless()) && !m_pcEncCfg->getRGBFormatFlag())
         {
           skipSecColorSpace = true;
         }
         if (!skipSecColorSpace && !tempCS->firstColorSpaceTestOnly)
         {
-          xCheckRDCostIntra(tempCS, bestCS, partitioner, currTestMode, (m_pcEncCfg->getRGBFormatFlag() ? false : true));
+          xCheckRDCostIntra(tempCS, bestCS, partitioner, currTestMode, (m_pcEncCfg->getRGBFormatFlag() ? false : true), intraInfo, cuCls);
         }
 
         if (!tempCS->firstColorSpaceTestOnly)
@@ -859,7 +1605,7 @@ void EncCu::xCompressCU( CodingStructure*& tempCS, CodingStructure*& bestCS, Par
       }
       else
       {
-        xCheckRDCostIntra(tempCS, bestCS, partitioner, currTestMode, false);
+        xCheckRDCostIntra(tempCS, bestCS, partitioner, currTestMode, false, intraInfo, cuCls);
       }
       splitRdCostBest[CTU_LEVEL] = bestCS->cost;
       tempCS->splitRdCostBest = splitRdCostBest;
@@ -966,6 +1712,116 @@ void EncCu::xCompressCU( CodingStructure*& tempCS, CodingStructure*& bestCS, Par
     {
       THROW( "Don't know how to handle mode: type = " << currTestMode.type << ", options = " << currTestMode.opts );
     }
+
+    /***************** 模式终止 *****************/
+
+#if ((PREDECT_INTRA | PREDECT_PLT) & PREDECT_T)
+
+    double bestCost;
+    double bestBits;
+    double bestDist;
+    double bestResAve;
+
+    if ((currTestMode.type == ETM_INTRA && predictIntraT) || (currTestMode.type == ETM_PALETTE && predictPltT))
+    {
+      bestCost = bestCS->cost;
+      bestBits = bestCS->fracBits;
+      bestDist = bestCS->dist;
+
+      PelBuf predBuf = bestCS->picture->getPredBuf(currCsArea.Y());
+      PelBuf recoBuf = bestCS->picture->getRecoBuf(currCsArea.Y());
+
+      double allSum = 0;
+      for (int h = 0; h < lheightCurrArea; h++)
+      {
+        for (int w = 0; w < lwidthCurrArea; w++)
+        {
+          allSum += int(abs(recoBuf.at(w, h) - predBuf.at(w, h)));
+        }
+      }
+      bestResAve = allSum / (lheightCurrArea * lwidthCurrArea);
+    }
+#endif
+
+#if (PREDECT_INTRA & PREDECT_T)
+    if (currTestMode.type == ETM_INTRA && predictIntraT)
+    {
+      float featuresIntraT[6];
+      float classesIntraT[2] = { 0 };
+
+      featuresIntraT[0] = probabilityIntra;
+      featuresIntraT[1] = bestCost;
+      featuresIntraT[2] = bestBits;
+      featuresIntraT[3] = bestDist;
+      featuresIntraT[4] = bestResAve;
+      featuresIntraT[5] = intraInfo.bestModeType;
+
+      float thresholdIntraT = 1;
+      
+      if (cuCls == A)
+      {
+        intraTAPredict(featuresIntraT, classesIntraT);
+        thresholdIntraT = thresholds[TH_INTRA_T_A];
+      }
+      else if (cuCls == TGM)
+      {
+        intraTTGMPredict(featuresIntraT, classesIntraT);
+        thresholdIntraT = thresholds[TH_INTRA_T_TGM];
+      }
+
+      if (classesIntraT[0] != 0 || classesIntraT[1] != 0)
+      {
+        float probabilityIntraT = classesIntraT[1] / (classesIntraT[0] + classesIntraT[1]);
+        if (probabilityIntraT > thresholdIntraT)
+        {
+          modeCheckFlag[PRE_INTRA]  = false;
+          modeCheckFlag[PRE_PLT]    = false;
+          modeCheckFlag[PRE_IMERGE] = false;
+          modeCheckFlag[PRE_IBC]    = false;
+        }
+      }
+    }
+#endif
+
+#if (PREDECT_PLT & PREDECT_T)
+    if (currTestMode.type == ETM_PALETTE && predictPltT)
+    {
+      float featuresPltT[6];
+      float classesPltT[2] = { 0 };
+
+      featuresPltT[0] = probabilityPlt;
+      featuresPltT[1] = bestCost;
+      featuresPltT[2] = bestBits;
+      featuresPltT[3] = bestDist;
+      featuresPltT[4] = bestResAve;
+      featuresPltT[5] = currBestMode;
+
+      float thresholdPltT = 1;
+
+      if (cuCls == A)
+      {
+        pltTAPredict(featuresPltT, classesPltT);
+        thresholdPltT = thresholds[TH_PLT_T_A];
+      }
+      else if (cuCls == TGM)
+      {
+        pltTTGMPredict(featuresPltT, classesPltT);
+        thresholdPltT = thresholds[TH_PLT_T_TGM];
+      }
+
+      if (classesPltT[0] != 0 || classesPltT[1] != 0)
+      {
+        float probabilityPltT = classesPltT[1] / (classesPltT[0] + classesPltT[1]);
+        if (probabilityPltT > thresholdPltT)
+        {
+          modeCheckFlag[PRE_INTRA]  = false;
+          modeCheckFlag[PRE_PLT]    = false;
+          modeCheckFlag[PRE_IMERGE] = false;
+          modeCheckFlag[PRE_IBC]    = false;
+        }
+      }
+    }
+#endif
   } while( m_modeCtrl->nextMode( *tempCS, partitioner ) );
 
 
@@ -1529,8 +2385,9 @@ void EncCu::xCheckModeSplit(CodingStructure *&tempCS, CodingStructure *&bestCS, 
   tempCS->prevQP[partitioner.chType] = oldPrevQp;
 }
 
-bool EncCu::xCheckRDCostIntra(CodingStructure *&tempCS, CodingStructure *&bestCS, Partitioner &partitioner, const EncTestMode& encTestMode, bool adaptiveColorTrans)
-{
+bool EncCu::xCheckRDCostIntra(CodingStructure *&tempCS, CodingStructure *&bestCS, Partitioner &partitioner,
+                              const EncTestMode &encTestMode, bool adaptiveColorTrans, IntraInfo &intraInfo,
+                              CuType cuCls){
   double          bestInterCost             = m_modeCtrl->getBestInterCost();
   double          costSize2Nx2NmtsFirstPass = m_modeCtrl->getMtsSize2Nx2NFirstPassCost();
   bool            skipSecondMtsPass         = m_modeCtrl->getSkipSecondMTSPass();
@@ -1585,8 +2442,23 @@ bool EncCu::xCheckRDCostIntra(CodingStructure *&tempCS, CodingStructure *&bestCS
     CHECK(adaptiveColorTrans && (CS::isDualITree(*tempCS) || partitioner.chType != CHANNEL_TYPE_LUMA), "adaptive color transform cannot be applied to dual-tree");
   }
 
+  m_pcIntraSearch->cuCls               = cuCls;
+  m_pcIntraSearch->lumaQP              = lumaQP;
+  m_pcIntraSearch->searchTerminateFlag = false;
+
+  m_pcIntraSearch->isISP = false;
+
+  double intraCost = MAX_DOUBLE;
+
   for( int trGrpIdx = 0; trGrpIdx < grpNumMax; trGrpIdx++ )
   {
+    /// add：最佳模式为bdpcm时不需要再进行变换核遍历
+
+    if (m_pcIntraSearch->searchTerminateFlag)
+    {
+      break;
+    }
+
     const uint8_t startMtsFlag = trGrpIdx > 0;
     const uint8_t endMtsFlag   = sps.getUseLFNST() ? considerMtsSecondPass : 0;
 
@@ -1594,8 +2466,18 @@ bool EncCu::xCheckRDCostIntra(CodingStructure *&tempCS, CodingStructure *&bestCS
     {
       for( int lfnstIdx = startLfnstIdx; lfnstIdx <= endLfnstIdx; lfnstIdx++ )
       {
+        if (m_pcIntraSearch->searchTerminateFlag)
+        {
+          break;
+        }
+
         for( uint8_t mtsFlag = startMtsFlag; mtsFlag <= endMtsFlag; mtsFlag++ )
         {
+          if (m_pcIntraSearch->searchTerminateFlag)
+          {
+            break;
+          }
+
           if (sps.getUseColorTrans() && !CS::isDualITree(*tempCS))
           {
             m_pcIntraSearch->setSavedRdModeIdx(trGrpIdx*(NUM_LFNST_NUM_PER_SET * 2) + lfnstIdx * 2 + mtsFlag);

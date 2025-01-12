@@ -47,6 +47,61 @@
 
 #include <math.h>
 
+/// ctu类型预测
+
+#include <torch/script.h>
+
+static torch::jit::script::Module ctuContentModule = torch::jit::load("scc_content_300.pt");
+
+void predictCTUContent(Picture *pcPic, float *&resultCTUContent)
+{
+  /// ctu的数量（不计算边缘）
+
+  int    ctuWidthNum    = pcPic->lwidth() / 128;
+  int    ctuHeightNum   = pcPic->lheight() / 128;
+  int    batchSize      = ctuWidthNum * ctuHeightNum;
+  float *ctusLumaValues = new float[batchSize * 128 * 128];
+
+  PelBuf origBuf = pcPic->getTrueOrigBuf().Y();
+  int    lumaNum = 0;
+  for (int h = 0; h < ctuHeightNum; h++)
+  {
+    for (int w = 0; w < ctuWidthNum; w++)
+    {
+      for (int lh = 0; lh < 128; lh++)
+      {
+        for (int lw = 0; lw < 128; lw++)
+        {
+          ctusLumaValues[lumaNum++] = float(origBuf.at(w * 128 + lw, h * 128 + lh)) / 255;
+        }
+      }
+    }
+  }
+
+  // clock_t start = clock();
+
+  try
+  {
+    torch::Tensor inputTensor  = torch::from_blob(ctusLumaValues, { batchSize, 1, 128, 128 });
+    at::Tensor    outputTensor = ctuContentModule
+                                .forward({
+                                  inputTensor,
+                                })
+                                .toTensor();
+    resultCTUContent = new float[batchSize * 3 * 32 * 32];
+    memcpy(resultCTUContent, outputTensor.data_ptr<float>(), sizeof(float) * outputTensor.numel());
+  }
+  catch (const c10::Error &e)
+  {
+    std::cout << e.msg() << std::endl;
+  }
+
+  // clock_t end = clock();
+  // std::cout< < "time = " << double(end - start) / CLOCKS_PER_SEC << "s" << std::endl;
+
+  delete[] ctusLumaValues;
+}
+
 //! \ingroup EncoderLib
 //! \{
 
@@ -1714,6 +1769,20 @@ void EncSlice::encodeCtus( Picture* pcPic, const bool bCompressEntireSlice, cons
     }
   }
 
+  /*** ctu类型预测 ***/
+
+  float *resultCTUContent = nullptr;
+  predictCTUContent(pcPic, resultCTUContent);
+
+  PicPredictor picPredictor;
+  picPredictor.ctuWidthNum      = pcPic->lwidth() / 128;
+  picPredictor.ctuHightNum      = pcPic->lheight() / 128;
+  picPredictor.resultCTUContent = resultCTUContent;
+
+  m_pcCuEncoder->setPicPredictor(picPredictor);
+
+  /******************/
+
   // for every CTU in the slice
   for( uint32_t ctuIdx = 0; ctuIdx < pcSlice->getNumCtuInSlice(); ctuIdx++ )
   {
@@ -1988,6 +2057,13 @@ void EncSlice::encodeCtus( Picture* pcPic, const bool bCompressEntireSlice, cons
         }
       }
     }
+  }
+
+  /// add：释放内存
+
+  if (resultCTUContent != nullptr)
+  {
+    delete[] resultCTUContent;
   }
 
   // this is wpp exclusive section
